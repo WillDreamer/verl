@@ -1,27 +1,42 @@
 set -x
 
+# ======================== GPU auto selection ========================
+GPU_LIST=(0 2)  # <<<------  which GPUs to use, directly fill here
+# Automatically concatenate CUDA_VISIBLE_DEVICES according to GPU_LIST
+CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
+export CUDA_VISIBLE_DEVICES
+echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+# Automatically detect the number of n_gpus_per_node
+NUM_GPUS=${#GPU_LIST[@]}
+echo "Detected ${NUM_GPUS} GPUs for this run"
+
+source ~/anaconda3/etc/profile.d/conda.sh
+cd /data1/whx/verl
+conda activate agentrl_science_async
+
 export VLLM_USE_V1=1
 
-# ================= data/model/tool =================
-HDFS_ROOT=${HDFS_ROOT:-$PWD}
-DATA_ROOT=${DATA_ROOT:-$PWD}
 
-dapo_math_17k=$DATA_ROOT/dataset/BytedTsinghua-SIA/DAPO-Math-17k
-aime_2024=$DATA_ROOT/dataset/Maxwell-Jia/AIME_2024
-aime_2025=$DATA_ROOT/dataset/yentinglin/aime_2025
-model_path=$HDFS_ROOT/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372
+# train_files=["/home/xw27/agent/ARLArena/datasets/simplelr_math_35/train.parquet","/home/xw27/agent/ARLArena/datasets/deepscaler/train.parquet"]
+# test_files=["/home/xw27/agent/ARLArena/datasets/simplelr_math_35/test.parquet","/home/xw27/agent/ARLArena/datasets/deepscaler/aime.parquet","/home/xw27/agent/ARLArena/datasets/deepscaler/aime25.parquet","/home/xw27/agent/ARLArena/datasets/deepscaler/olympiad.parquet","/home/xw27/agent/ARLArena/datasets/deepscaler/math.parquet"]
+model_path=Qwen/Qwen3-0.6B
+
+dapo_math_17k=BytedTsinghua-SIA/DAPO-Math-17k
+aime_2024=Maxwell-Jia/AIME_2024
+aime_2025=yentinglin/aime_2025
+# model_path=$HDFS_ROOT/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372
 
 train_files="['$dapo_math_17k']"
-test_files="['$aime_2025', '$aime_2024']"
+test_files="['$aime_2025','$aime_2024']"
 
 # tool
 tool_config_path=recipe/retool/sandbox_fusion_tool_config.yaml
 retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
-project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool
-default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
+project_name=math_async
+experiment_name=qwen0.6b_dapo_async_tool
+default_local_dir=/data1/whx/verl/outputs_$experiment_name
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -35,14 +50,16 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_turns=16
-max_prompt_length=2048
-max_response_length=16384
+# max_prompt_length=2048
+max_prompt_length=1024
+# max_response_length=16384
+max_response_length=4096
 actor_lr=1e-6
 
 # ================= perfomance =================
-infer_tp=4 # vllm
-train_sp=4 # train
-fsdp_size=4 # train
+infer_tp=$((NUM_GPUS/2)) # vllm
+train_sp=$((NUM_GPUS/2)) # train
+fsdp_size=$((NUM_GPUS/2)) # train
 offload=False
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
@@ -53,14 +70,16 @@ rollout_name="vllm"
 rollout_mode="async"
 
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=4
+NGPUS_PER_NODE=$NUM_GPUS
+n_gpus_rollout=$((NUM_GPUS/2))
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+gpu_memory_utilization=0.8
 
 train_batch_size=0
 ppo_mini_batch_size=16
 gen_prompt_bsz=1
-n_resp_per_prompt=16
+# n_resp_per_prompt=16
+n_resp_per_prompt=4
 n_resp_per_prompt_val=30
 total_rollout_steps=$(((64*250)))
 test_freq=10
@@ -69,12 +88,31 @@ trigger_parameter_sync_step=4
 require_batches=1
 partial_rollout=True
 
-python3 -m recipe.fully_async_policy.fully_async_main \
+# ======================== start ray ========================
+RAY_TMP=/data1/whx/verl/outputs
+mkdir -p $RAY_TMP
+export RAY_TMPDIR="$RAY_TMP"
+export TMPDIR="$RAY_TMP"
+# if pgrep -f "ray" > /dev/null; then
+#     echo "==================== Detected existing Ray processes, exiting... ===================="
+#     exit 1
+# fi
+PORT=$(( ( RANDOM % 10000 + 1000 ) ))
+DASHBOARD_PORT=$(( ( RANDOM % 10000 + 1000 ) ))
+PORT=1376
+DASHBOARD_PORT=1377
+# ray start --head --port 3334 --temp-dir "$RAY_TMP" --dashboard-port 3333
+ray start --head --port $PORT --dashboard-port $DASHBOARD_PORT
+RUN_NAME+="_$experiment_name"
+export RAY_ADDRESS="127.0.0.1:${PORT}"
+echo "RAY_ADDRESS=$RAY_ADDRESS"
+
+PYTHONUNBUFFERED=1 python -m recipe.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
-    data.train_files="$train_files" \
-    data.val_files="$test_files" \
+    data.train_files=$train_files \
+    data.val_files=$test_files \
     data.return_raw_chat=True \
     data.train_batch_size=$train_batch_size \
     data.max_prompt_length=$max_prompt_length \
@@ -113,7 +151,7 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
