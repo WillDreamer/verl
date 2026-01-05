@@ -1,0 +1,177 @@
+set -x
+
+# ======================== GPU auto selection ========================
+GPU_LIST=(0 1 2 3)  # <<<------  which GPUs to use, directly fill here
+# Automatically concatenate CUDA_VISIBLE_DEVICES according to GPU_LIST
+CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_LIST[*]}")
+export CUDA_VISIBLE_DEVICES
+echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+# Automatically detect the number of n_gpus_per_node
+NUM_GPUS=${#GPU_LIST[@]}
+echo "Detected ${NUM_GPUS} GPUs for this run"
+
+source ~/anaconda3/etc/profile.d/conda.sh
+cd /data1/whx/verl
+conda activate agentrl_science_async
+
+WANDB_API_KEY="ba70fcbc92808cc7a1750dd80ac3908295e6854f" # Modify your wandb key
+# ============================ Preparation ============================
+# Login to WandB (if API key is provided)
+if [ "$WANDB_API_KEY" != "" ]; then
+    wandb login --relogin $WANDB_API_KEY
+    export WANDB_DIR=${SAVE_PATH}
+fi
+
+export VLLM_USE_V1=1
+
+
+model_path=Qwen/Qwen3-0.6B
+train_dataset_size=16  # Number of placeholder samples for training
+val_dataset_size=128     # Number of placeholder samples for validation
+
+
+# wandb / tensorboard
+project_name=web_async
+experiment_name=qwen0.6b_dapo_async_web
+default_local_dir=/data1/whx/verl/checkpoints/$experiment_name
+mkdir -p /data1/whx/verl/outputs/$experiment_name
+timeline_json_file=/data1/whx/verl/outputs/$experiment_name/timeline.json
+global_profiler_save_path=/data1/whx/verl/outputs/$experiment_name/global_profiler
+
+# ================= algorithm =================
+adv_estimator=grpo
+
+use_kl_in_reward=False
+kl_coef=0.0
+use_kl_loss=False
+kl_loss_coef=0.0
+
+clip_ratio_low=0.2
+clip_ratio_high=0.28
+
+max_turns=16
+# max_prompt_length=2048
+max_prompt_length=1024
+# max_response_length=16384
+max_response_length=4096
+actor_lr=1e-6
+
+# ================= perfomance =================
+infer_tp=$((NUM_GPUS/2)) # vllm
+train_sp=$((NUM_GPUS/2)) # train
+fsdp_size=$((NUM_GPUS/2)) # train
+offload=False
+
+actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
+log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
+
+# ================= async policy =================
+rollout_name="vllm"
+rollout_mode="async"
+
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=$NUM_GPUS
+n_gpus_rollout=$((NUM_GPUS/2))
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+gpu_memory_utilization=0.5
+
+train_batch_size=0
+ppo_mini_batch_size=16
+gen_prompt_bsz=1
+# n_resp_per_prompt=16
+n_resp_per_prompt=8
+n_resp_per_prompt_val=1
+total_rollout_steps=$(((64*250)))
+test_freq=10
+staleness_threshold=0.5
+trigger_parameter_sync_step=4
+require_batches=1
+partial_rollout=True
+
+# ======================== start ray ========================
+RAY_TMP=/data1/whx/verl/outputs/tmp
+rm -rf $RAY_TMP
+mkdir -p $RAY_TMP
+export RAY_TMPDIR="$RAY_TMP"
+export TMPDIR="$RAY_TMP"
+# if pgrep -f "ray" > /dev/null; then
+#     echo "==================== Detected existing Ray processes, exiting... ===================="
+#     exit 1
+# fi
+PORT=$(( ( RANDOM % 10000 + 1000 ) ))
+DASHBOARD_PORT=$(( ( RANDOM % 10000 + 1000 ) ))
+PORT=1376
+DASHBOARD_PORT=1377
+# ray start --head --port 3334 --temp-dir "$RAY_TMP" --dashboard-port 3333
+ray start --head --port $PORT --dashboard-port $DASHBOARD_PORT
+RUN_NAME+="_$experiment_name"
+export RAY_ADDRESS="127.0.0.1:${PORT}"
+echo "RAY_ADDRESS=$RAY_ADDRESS"
+
+PYTHONUNBUFFERED=1 python -m recipe.fully_async_policy.fully_async_main \
+    algorithm.adv_estimator=$adv_estimator \
+    algorithm.use_kl_in_reward=$use_kl_in_reward \
+    algorithm.kl_ctrl.kl_coef=$kl_coef \
+    data.train_dataset_size=$train_dataset_size \
+    data.val_dataset_size=$val_dataset_size \
+    data.return_raw_chat=True \
+    data.train_batch_size=$train_batch_size \
+    data.max_prompt_length=$max_prompt_length \
+    data.max_response_length=$max_response_length \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    actor_rollout_ref.hybrid_engine=False \
+    actor_rollout_ref.model.path=$model_path \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.use_kl_loss=$use_kl_loss \
+    actor_rollout_ref.actor.kl_loss_coef=$kl_loss_coef \
+    actor_rollout_ref.actor.clip_ratio_low=$clip_ratio_low \
+    actor_rollout_ref.actor.clip_ratio_high=$clip_ratio_high \
+    actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    actor_rollout_ref.actor.optim.lr=$actor_lr \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$actor_max_token_len_per_gpu \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=$train_sp \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$offload \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$offload \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$log_prob_max_token_len_per_gpu \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$infer_tp \
+    actor_rollout_ref.rollout.multi_turn.enable=True \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=$max_turns \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
+    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
+    actor_rollout_ref.rollout.n=$n_resp_per_prompt \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name=$project_name \
+    trainer.experiment_name=$experiment_name \
+    trainer.val_before_train=True \
+    trainer.log_val_generations=20 \
+    trainer.save_freq=-1 \
+    trainer.default_local_dir=$default_local_dir \
+    data.gen_batch_size=${gen_prompt_bsz} \
+    trainer.nnodes=$NNODES \
+    trainer.n_gpus_per_node=$n_gpus_training \
+    rollout.nnodes=$NNODES \
+    rollout.n_gpus_per_node=$n_gpus_rollout \
+    rollout.total_rollout_steps=$total_rollout_steps \
+    rollout.total_epochs=150 \
+    rollout.test_freq=$test_freq \
+    async_training.staleness_threshold=$staleness_threshold \
+    async_training.trigger_parameter_sync_step=$trigger_parameter_sync_step \
+    async_training.require_batches=$require_batches \
+    async_training.partial_rollout=$partial_rollout \
+    async_training.use_rollout_log_probs=True \
+    ray_kwargs.timeline_json_file=$timeline_json_file \
+    global_profiler.save_path=$global_profiler_save_path

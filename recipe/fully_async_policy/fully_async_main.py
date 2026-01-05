@@ -251,6 +251,11 @@ class FullyAsyncTaskRunner:
         self.running = True
 
         print("[ASYNC MAIN] Starting Rollouter and Trainer...")
+
+        #* 在 Ray 中，future（也称为 ObjectRef）是异步调用的句柄/引用
+        # 调用 .remote() 会立即返回一个 Future，而不是等待任务完成
+        # 将 fit() 方法提交到 Ray 集群异步执行
+        # future返回的是结果的引用，可通过 ray.get() 获取
         rollouter_future = self.components["rollouter"].fit.remote()
         trainer_future = self.components["trainer"].fit.remote()
 
@@ -259,10 +264,12 @@ class FullyAsyncTaskRunner:
         try:
             while futures:
                 # Use ray.wait to monitor all futures and return when any one is completed.
+                # ray.wait() 会等待至少一个 Future 完成，返回已完成和未完成的列表
                 done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
 
                 for future in done_futures:
                     try:
+                        # 阻塞等待，直到任务完成并返回结果
                         ray.get(future)
                         print("[ASYNC MAIN] One component completed successfully")
                     except Exception as e:

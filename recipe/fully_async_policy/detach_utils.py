@@ -77,7 +77,21 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
     )
 
     # Setting selected agent, that supports partial
-    if config.actor_rollout_ref.rollout.multi_turn.enable:
+    # Check if environment interaction is enabled
+    # If env config exists and has env_name, use environment agent loop
+    use_env_interaction = (
+        hasattr(config, "env")
+        and config.env is not None
+        and hasattr(config.env, "env_name")
+        and config.env.env_name is not None
+    )
+    
+    if use_env_interaction:
+        # Use multi-turn environment agent loop
+        full_batch.non_tensor_batch["agent_name"] = np.array(
+            ["async_partial_multi_turn_env_agent"] * len(full_batch), dtype=object
+        )
+    elif config.actor_rollout_ref.rollout.multi_turn.enable:
         full_batch.non_tensor_batch["agent_name"] = np.array(
             ["async_partial_tool_agent"] * len(full_batch), dtype=object
         )

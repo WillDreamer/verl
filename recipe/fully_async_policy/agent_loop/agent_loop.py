@@ -67,6 +67,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             - Element 2 (bool): A flag or status indicating cancellation.
         """
         server = self._choose_server(request_id)
+        #* vLLMHttpServerForPartial
         output = await server.generate_for_partial.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,
@@ -131,6 +132,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             for i in range(len(batch)):
                 kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
                 kwargs["output"] = partial_output_list[i]
+                # Pass gen_batch (the full batch) to agent loop for environment interaction
+                # This is needed for env.reset() to access env_kwargs and other batch-level data
+                # For environment interaction, we need the full batch structure
+                kwargs["gen_batch"] = batch
+                # Also pass meta_info for context
+                kwargs["meta_info"] = batch.meta_info
                 tasks.append(
                     asyncio.create_task(self._partial_run_agent_loop(sampling_params, trajectory_info[i], **kwargs))
                 )
@@ -179,7 +186,7 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
                     f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
                 )
 
-                agent_loop_config = _agent_loop_registry[agent_name]
+                agent_loop_config = _agent_loop_registry[agent_name] #agent_name: async_partial_tool_agent
                 agent_loop = hydra.utils.instantiate(
                     config=agent_loop_config,
                     trainer_config=DictConfigWrap(config=self.config),

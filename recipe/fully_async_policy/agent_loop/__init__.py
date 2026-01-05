@@ -15,6 +15,7 @@
 from .agent_loop import FullyAsyncAgentLoopManager
 from .partial_single_turn_agent_loop import PartialSingleTurnAgentLoop
 from .partial_tool_agent_loop import AsyncPartialToolAgentLoop
+from .multi_turn_env_agent_loop import AsyncPartialMultiTurnEnvAgentLoop
 
-_ = [PartialSingleTurnAgentLoop, AsyncPartialToolAgentLoop]
+_ = [PartialSingleTurnAgentLoop, AsyncPartialToolAgentLoop, AsyncPartialMultiTurnEnvAgentLoop]
 __all__ = [FullyAsyncAgentLoopManager]
