@@ -152,8 +152,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             )
         else:
             # Use normal dataset from files
-            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
-            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
+        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         
         train_sampler = create_rl_sampler(config.data, train_dataset)
 

@@ -206,6 +206,32 @@ class AsyncPartialMultiTurnEnvAgentLoop(AgentLoopBase):
         agent_data.extra_fields["episode_lengths"] = 0
         agent_data.extra_fields["tool_callings"] = 0.0
         agent_data.extra_fields["uid"] = str(uuid.uuid4())  # For env grouping if needed
+        
+        # Get or generate global environment index for this sample
+        # Try to get from kwargs, gen_batch meta_info, or generate from request_id
+        global_env_index = kwargs.get("env_index", None)
+        if global_env_index is None and gen_batch is not None:
+            global_env_index = gen_batch.meta_info.get("env_index", None)
+        if global_env_index is None:
+            # Generate a deterministic index from request_id hash
+            # This ensures the same request_id always maps to the same env index
+            import hashlib
+            hash_obj = hashlib.md5(request_id.encode())
+            hash_int = int(hash_obj.hexdigest(), 16)
+            # Get num_envs if available, otherwise use a default modulo
+            num_envs = getattr(self.envs, 'num_envs', None) if self.envs else None
+            if num_envs is None:
+                # Try to get from config
+                num_envs = getattr(self.config.env, 'env_num', None)
+            if num_envs is None:
+                # Fallback: use a large number to distribute across many envs
+                num_envs = 1000
+            global_env_index = hash_int % num_envs
+            logger.info(f"[MultiTurnEnvAgent] Generated env_index {global_env_index} from request_id hash (num_envs={num_envs})")
+        else:
+            logger.info(f"[MultiTurnEnvAgent] Using provided env_index {global_env_index}")
+        
+        agent_data.extra_fields["global_env_index"] = global_env_index
 
         return agent_data
 
@@ -498,7 +524,7 @@ class AsyncPartialMultiTurnEnvAgentLoop(AgentLoopBase):
             None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
         )
 
-        # Step environment
+        # Update agent_data with generated response (no environment interaction here)
         agent_data.assistant_turns += 1
         agent_data.response_ids = response_ids
         agent_data.prompt_ids += agent_data.response_ids
@@ -526,25 +552,53 @@ class AsyncPartialMultiTurnEnvAgentLoop(AgentLoopBase):
         # Add uid and traj_uid to batch (similar to original)
         current_batch.non_tensor_batch["uid"] = np.array([agent_data.extra_fields["uid"]], dtype=object)
         current_batch.non_tensor_batch["traj_uid"] = np.array([agent_data.extra_fields["traj_uid"]], dtype=object)
+        
+        # Store generated data for environment interaction in next state
+        agent_data.extra_fields["current_batch"] = current_batch
+        agent_data.extra_fields["pending_text_action"] = text_action
+        agent_data.extra_fields["pending_response_ids"] = response_ids
+        agent_data.extra_fields["pending_step"] = step
 
-        # Step environment (synchronous call, run in executor)
-        next_obs, rewards, dones, infos = await self.loop.run_in_executor(
-            None, lambda: self.envs.step([text_action])
-        )
+        # Transition to PROCESSING_TOOLS state for environment interaction
+        return AgentState.PROCESSING_TOOLS
 
-        # Process rewards and dones
-        if len(rewards.shape) == 2:
-            rewards = rewards.squeeze(1)
-        if len(dones.shape) == 2:
-            dones = dones.squeeze(1)
+    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        """Handle processing tools state: execute environment step with generated action."""
+        # Get pending action and data from generating state
+        text_action = agent_data.extra_fields.get("pending_text_action", None)
+        response_ids = agent_data.extra_fields.get("pending_response_ids", None)
+        step = agent_data.extra_fields.get("pending_step", agent_data.extra_fields["step"])
+        current_batch = agent_data.extra_fields.get("current_batch", None)
+        global_env_index = agent_data.extra_fields.get("global_env_index", None)
+        
+        if text_action is None or current_batch is None:
+            logger.error("[MultiTurnEnvAgent] Missing pending action or batch data in PROCESSING_TOOLS state")
+            return AgentState.TERMINATED
+        
+        if global_env_index is None:
+            logger.error("[MultiTurnEnvAgent] Missing global_env_index in PROCESSING_TOOLS state")
+            return AgentState.TERMINATED
 
-        rewards = torch_to_numpy(rewards)
-        dones = torch_to_numpy(dones)
-
-        # Extract reward and done for single sample
-        reward = rewards[0] if len(rewards) > 0 else 0.0
-        is_done = dones[0] if len(dones) > 0 else False
-        info = infos[0] if len(infos) > 0 else {}
+        
+        processing_envs = self.envs[global_env_index]
+        def step_env():
+            return processing_envs.step(text_action)
+        
+        next_obs, rewards, dones, infos = await self.loop.run_in_executor(None, step_env)
+        
+        # Ensure we have valid indices and extract results
+        reward = float(rewards)
+        is_done = bool(dones)
+        info = infos
+        
+        # Extract observation for the specific environment index
+        if isinstance(next_obs, dict):
+            # Extract observation components for the specific env index
+            obs_for_env = {}
+            for key in ["text", "image", "anchor"]:
+                if key in next_obs and next_obs[key] is not None:
+                    obs_for_env[key] = next_obs[key]
+            next_obs = obs_for_env
 
         # Add fields to batch (similar to original version)
         current_batch.non_tensor_batch["rewards"] = np.array([reward], dtype=object)
@@ -597,13 +651,14 @@ class AsyncPartialMultiTurnEnvAgentLoop(AgentLoopBase):
         # Update observation for next step
         agent_data.extra_fields["obs"] = next_obs
         agent_data.extra_fields["infos"] = infos
+        
+        # Clear pending data
+        agent_data.extra_fields.pop("pending_text_action", None)
+        agent_data.extra_fields.pop("pending_response_ids", None)
+        agent_data.extra_fields.pop("pending_step", None)
 
         # Continue to next turn
         return AgentState.PENDING
-
-    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
-        """Handle processing tools state (not used in environment interaction, but required by interface)."""
-        return AgentState.TERMINATED
 
     def _build_completed_output(self, agent_data: AgentData, param_version: int) -> AgentLoopOutput:
         """Build completed output."""
